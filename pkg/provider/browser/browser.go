@@ -1,16 +1,18 @@
 package browser
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/playwright-community/playwright-go"
+	"github.com/sirupsen/logrus"
+	"github.com/versent/saml2aws/v2/helper/credentials"
+	"github.com/versent/saml2aws/v2/pkg/cfg"
+	"github.com/versent/saml2aws/v2/pkg/creds"
 	"net/url"
 	"regexp"
 	"strings"
-
-	"github.com/playwright-community/playwright-go"
-	"github.com/sirupsen/logrus"
-	"github.com/versent/saml2aws/v2/pkg/cfg"
-	"github.com/versent/saml2aws/v2/pkg/creds"
+	"time"
 )
 
 var logger = logrus.WithField("provider", "browser")
@@ -161,6 +163,271 @@ var getSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetail
 		return "", err
 	}
 
+	return values.Get("SAMLResponse"), nil
+}
+
+func pageWaitForOneOfLocatorVisible(page playwright.Page, selectors []string) (playwright.Locator, *string, error) {
+	var locator playwright.Locator
+	var locatorErrors []error
+	var matchedSelectorStr string // for debug output
+	for _, k := range selectors {
+		selectorStr := k
+		locator = page.Locator(selectorStr)
+		err := locator.WaitFor(playwright.LocatorWaitForOptions{
+			State: playwright.WaitForSelectorStateVisible,
+		})
+		if err != nil {
+			locatorErrors = append(locatorErrors, err)
+		} else {
+			matchedSelectorStr = selectorStr
+			break
+		}
+	}
+	if locator == nil {
+		return nil, nil, fmt.Errorf("error finding one or more selectors in the list: %v", locatorErrors)
+	} else {
+		return locator, &matchedSelectorStr, nil
+	}
+}
+
+func findPlaywrightCookiesInCredentialStore(loginDetails *creds.LoginDetails) ([]playwright.OptionalCookie, error) {
+	credHelperPlaywrightCookiesUrl := loginDetails.URL + "/playwrightCookies"
+	var foundCookies []playwright.OptionalCookie
+	// check for existing cookies in keychain
+	_, playwrightCookies, err := credentials.CurrentHelper.Get(credHelperPlaywrightCookiesUrl)
+	if err != nil {
+		return nil, fmt.Errorf("no playwright cookies found in keychain for '%s'", loginDetails.URL)
+	} else {
+		if playwrightCookies == "expiredCookies" {
+			return nil, fmt.Errorf("playwright cookies found in keychain for '%s' are expired")
+		} else {
+			err = json.Unmarshal([]byte(playwrightCookies), &foundCookies)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshaling playwright cookies found in keychain for '%s': %v", loginDetails.URL, err)
+			}
+		}
+	}
+	return foundCookies, nil
+}
+
+func setPlaywrightCookiesAsExpiredInCredentialStore(loginDetails *creds.LoginDetails) error {
+	credHelperPlaywrightCookiesUrl := loginDetails.URL + "/playwrightCookies"
+	err := credentials.SaveCredentials(credHelperPlaywrightCookiesUrl, loginDetails.Username, "expiredCookies")
+	if err != nil {
+		return fmt.Errorf("error clearing playwright cookies for '%s' in keychain: %v", loginDetails.URL, err)
+	}
+	return nil
+}
+
+func savePlaywrightCookiesInCredentialStore(loginDetails *creds.LoginDetails, cookies []playwright.OptionalCookie) error {
+	if cookies == nil {
+		return fmt.Errorf("nil cookies")
+	}
+	credHelperPlaywrightCookiesUrl := loginDetails.URL + "/playwrightCookies"
+	allCookiesJsonBytes, err := json.Marshal(cookies)
+	if err != nil {
+		logger.Debugf("error marshaling playwright active browser cookies for '%s': %v", loginDetails.URL, err)
+	} else {
+		err = credentials.SaveCredentials(credHelperPlaywrightCookiesUrl, loginDetails.Username, string(allCookiesJsonBytes))
+		if err != nil {
+			return fmt.Errorf("error saving playwright active browser cookies for '%s' in keychain: %v", loginDetails.URL, err)
+		}
+	}
+	return nil
+}
+
+func addPlaywrightCookiesToPage(page playwright.Page, cookies []playwright.OptionalCookie) error {
+	if cookies == nil {
+		return fmt.Errorf("nil cookies")
+	}
+	for _, fc := range cookies {
+		foundCookie := fc
+		if foundCookie.URL != nil && foundCookie.Domain != nil {
+			foundCookie.URL = nil
+		}
+		if foundCookie.Expires != nil && foundCookie.Name == "aws-vid" { // aws-vid cookie expiry breaks playwright for some reason
+			expInt := time.Now().Add(time.Hour * 24 * 300).Unix()
+			expF := float64(expInt)
+			tmpFc := foundCookie
+			tmpFc.Expires = &expF
+			foundCookie = tmpFc
+		}
+		err := page.Context().AddCookies([]playwright.OptionalCookie{foundCookie})
+		if err != nil {
+			return fmt.Errorf("error adding playwright cookie name='%s',domain='%s': %v", foundCookie.Name, *foundCookie.Domain, err)
+		}
+	}
+	return nil
+}
+
+var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetails, client *Client) (string, error) {
+	logger.WithField("URL", loginDetails.URL).Info("opening browser")
+
+	// check for existing cookies in keychain
+	foundCookies, cookieErr := findPlaywrightCookiesInCredentialStore(loginDetails)
+
+	if cookieErr == nil {
+		cookieErr = addPlaywrightCookiesToPage(page, foundCookies)
+	}
+
+	if _, err := page.Goto(loginDetails.URL); err != nil {
+		return "", err
+	}
+
+	pageIsAwsSamlPage := false
+	if cookieErr == nil { // if found cookies were successfully loaded
+		// check if the url navigation ends up in aws saml page
+		signin_re, err := signinRegex()
+		if err == nil {
+			logger.Info("checking if stored browser cookies are valid...")
+			resp, _ := page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
+			if resp == nil || (resp != nil && !signin_re.MatchString(resp.URL())) {
+				logger.Info("stored browser cookies are expired, clearing cookies & resuming standard sign-in process")
+				cookieErr = fmt.Errorf("expired cookies")
+				err = page.Context().ClearCookies()
+				if err != nil {
+					logger.Debugf("error clearing active browser cookies: %v", err)
+				}
+				err = setPlaywrightCookiesAsExpiredInCredentialStore(loginDetails)
+				if err != nil {
+					logger.Debugf("setPlaywrightCookiesAsExpiredInCredentialStore error: %v", err)
+				}
+				if _, err := page.Goto(loginDetails.URL); err != nil {
+					return "", err
+				}
+			} else {
+				pageIsAwsSamlPage = true
+			}
+		}
+	}
+
+	oktaUsernameInputSelectors := []string{"input[name=\"identifier\"]", "input[autocomplete=\"username\"]"}
+	oktaRememberMeCheckboxSelectors := []string{"input[type=\"checkbox\"][name=\"rememberMe\"]"}
+	oktaNextButtonSelectors := []string{"input[type=\"submit\"][value=\"Next\"]"}
+	oktaPasswordInputSelectors := []string{"input[type=\"password\"]"}
+	oktaVerifyButtonSelectors := []string{"input[type=\"submit\"][value=\"Verify\"]"}
+	// okta_verify-totp for code
+	oktaMFASelectButtonSelectors := []string{"div[class=authenticator-button][data-se=\"okta_verify-push\""}
+
+	if cookieErr != nil { // if found cookies has errors loading
+		logger.Debugf("starting okta login page automation...")
+		usernameInputLocator, matchedUsernameInputSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaUsernameInputSelectors)
+		if err != nil {
+			logger.Debugf("okta username selector not found!, navigating to %s", loginDetails.URL)
+			if _, err := page.Goto(loginDetails.URL); err != nil {
+				return "", err
+			}
+		} else {
+			logger.Debugf("okta username selector '%s' selector is visible...", *matchedUsernameInputSelectorStr)
+		}
+
+		err = usernameInputLocator.Fill(loginDetails.Username)
+		if err != nil {
+			return "", fmt.Errorf("error filling in okta username field: %v", err)
+		}
+
+		rememberMeCheckboxSelector, matchedRememberMeCheckboxSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaRememberMeCheckboxSelectors)
+		if err != nil {
+			logger.Debug("okta remember me checkbox selector not found!")
+		} else {
+			logger.Debugf("okta remember me checkbox selector '%s' found, attempting to check it...", *matchedRememberMeCheckboxSelectorStr)
+			err = rememberMeCheckboxSelector.SetChecked(true)
+			if err != nil {
+				logger.Debugf("error checking the okta remember me checkbox: %v", err)
+			}
+		}
+
+		nextButtonSelector, matchedNextButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaNextButtonSelectors)
+		if err != nil {
+			return "", fmt.Errorf("okta Next button not found: %v", err)
+		} else {
+			logger.Debugf("okta Next button selector '%s' selector is visible...", *matchedNextButtonSelectorStr)
+		}
+
+		err = nextButtonSelector.Click()
+		if err != nil {
+			return "", fmt.Errorf("error clicking okta Next button: %v", err)
+		}
+
+		passwordInputLocator, matchedPasswordInputSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaPasswordInputSelectors)
+		if err != nil {
+			return "", fmt.Errorf("okta password selector not found: %v", err)
+		} else {
+			logger.Debugf("okta password selector '%s' selector is visible...", *matchedPasswordInputSelectorStr)
+		}
+
+		err = passwordInputLocator.Fill(loginDetails.Password)
+		if err != nil {
+			return "", fmt.Errorf("error filling in okta password field: %v", err)
+		}
+
+		verifyButtonSelector, matchedVerifyButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaVerifyButtonSelectors)
+		if err != nil {
+			return "", fmt.Errorf("okta Verify button not found: %v", err)
+		} else {
+			logger.Debugf("okta Verify button selector '%s' selector is visible...", *matchedVerifyButtonSelectorStr)
+		}
+
+		err = verifyButtonSelector.Click()
+		if err != nil {
+			return "", fmt.Errorf("error clicking okta Verify button: %v", err)
+		}
+
+		mfaSelectButtonSelector, matchedMFASelectButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaMFASelectButtonSelectors)
+		if err != nil {
+			return "", fmt.Errorf("okta MFA Select button not found: %v", err)
+		} else {
+			logger.Debugf("okta MFA Select button selector '%s' selector is visible...", *matchedMFASelectButtonSelectorStr)
+		}
+
+		err = mfaSelectButtonSelector.Click()
+		if err != nil {
+			return "", fmt.Errorf("error clicking okta MFA Select button: %v", err)
+		}
+
+		logger.Debugf("ui element query automation complete")
+	}
+
+	// https://docs.aws.amazon.com/general/latest/gr/signin-service.html
+	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Ningxia.html
+	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Beijing.html
+	signin_re, err := signinRegex()
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Println("waiting ...")
+	if pageIsAwsSamlPage {
+		go func() {
+			time.Sleep(5 * time.Second)
+			page.Reload()
+		}()
+	}
+	r, _ := page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
+	data, err := r.PostData()
+	if err != nil {
+		return "", err
+	}
+
+	values, err := url.ParseQuery(data)
+	if err != nil {
+		return "", err
+	}
+	pageCookies, err := page.Context().Cookies()
+	if err != nil {
+		logger.Debugf("error getting playwright active browser cookies for '%s': %v", loginDetails.URL, err)
+	} else {
+		var allCookies []playwright.OptionalCookie
+		for _, k := range pageCookies {
+			tmpCookie := k
+			optCookie := tmpCookie.ToOptionalCookie()
+			allCookies = append(allCookies, optCookie)
+		}
+		err = savePlaywrightCookiesInCredentialStore(loginDetails, allCookies)
+		if err != nil {
+			logger.Debugf("error saving playwright active browser cookies for '%s' in keychain: %v", loginDetails.URL, err)
+		}
+	}
 	return values.Get("SAMLResponse"), nil
 }
 
