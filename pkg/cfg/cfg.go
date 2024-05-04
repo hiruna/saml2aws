@@ -231,6 +231,25 @@ func (cm *ConfigManager) LoadIDPAccount(idpAccountName string) (*IDPAccount, err
 	return account, nil
 }
 
+// ListAccountNames returns a slice of all accounts stored in config
+func (cm *ConfigManager) ListAccountNames() ([]string, error) {
+	if cm == nil || (cm != nil && cm.configPath == "") {
+		return nil, fmt.Errorf("nil config manager")
+	}
+	cfg, err := ini.LoadSources(ini.LoadOptions{Loose: true, SpaceBeforeInlineComment: true}, cm.configPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "Unable to load configuration file")
+	}
+	var accountNames []string
+	for _, v := range cfg.Sections() {
+		if len(v.Keys()) != 0 { // Get only the sections having Keys
+			accountNames = append(accountNames, v.Name())
+		}
+
+	}
+	return accountNames, nil
+}
+
 func readAccount(idpAccountName string, cfg *ini.File) (*IDPAccount, error) {
 
 	account := NewIDPAccount()
