@@ -42,6 +42,7 @@ type IDPAccount struct {
 	BrowserType           string `ini:"browser_type,omitempty"`            // used by 'Browser' Provider
 	BrowserExecutablePath string `ini:"browser_executable_path,omitempty"` // used by 'Browser' Provider
 	BrowserAutoFill       bool   `ini:"browser_autofill,omitempty"`        // used by 'Browser' Provider
+	BrowserOktaAutoFill   bool   `ini:"browser_okta_autofill,omitempty"`   // used by 'Browser' Provider for Okta IDP
 	MFA                   string `ini:"mfa"`
 	MFAIPAddress          string `ini:"mfa_ip_address"` // used by OneLogin
 	SkipVerify            bool   `ini:"skip_verify"`

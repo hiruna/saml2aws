@@ -25,9 +25,10 @@ type Client struct {
 	BrowserExecutablePath string
 	Headless              bool
 	// Setup alternative directory to download playwright browsers to
-	BrowserDriverDir string
-	Timeout          int
-	BrowserAutoFill  bool
+	BrowserDriverDir    string
+	Timeout             int
+	BrowserAutoFill     bool
+	BrowserOktaAutoFill bool
 }
 
 // New create new browser based client
@@ -39,6 +40,7 @@ func New(idpAccount *cfg.IDPAccount) (*Client, error) {
 		BrowserExecutablePath: idpAccount.BrowserExecutablePath,
 		Timeout:               idpAccount.Timeout,
 		BrowserAutoFill:       idpAccount.BrowserAutoFill,
+		BrowserOktaAutoFill:   idpAccount.BrowserOktaAutoFill,
 	}, nil
 }
 
@@ -66,8 +68,22 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 		}
 	}
 
+	playwrightInstallAttemptOnRunError := false
+playwrightRun:
 	pw, err := playwright.Run(&runOptions)
 	if err != nil {
+		if playwrightInstallAttemptOnRunError { // to avoid a loop
+			return "", err
+		}
+		if strings.Contains(err.Error(), "could not start driver") && !loginDetails.DownloadBrowser {
+			playwrightInstallAttemptOnRunError = true
+			logger.Warnf("playwright run failed due to error '%v', attempting to download browser drivers...", err)
+			err = playwright.Install(&runOptions)
+			if err != nil {
+				return "", err
+			}
+			goto playwrightRun
+		}
 		return "", err
 	}
 
@@ -130,6 +146,10 @@ func (cl *Client) Authenticate(loginDetails *creds.LoginDetails) (string, error)
 }
 
 var getSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetails, client *Client) (string, error) {
+	if client.BrowserOktaAutoFill {
+		return getOktaSAMLResponse(page, loginDetails, client)
+	}
+
 	logger.WithField("URL", loginDetails.URL).Info("opening browser")
 
 	if _, err := page.Goto(loginDetails.URL); err != nil {
@@ -280,7 +300,8 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 		signin_re, err := signinRegex()
 		if err == nil {
 			logger.Info("checking if stored browser cookies are valid...")
-			resp, _ := page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
+			timeoutMillis := 5000.0
+			resp, _ := page.ExpectRequest(signin_re, nil, playwright.PageExpectRequestOptions{Timeout: &timeoutMillis})
 			if resp == nil || (resp != nil && !signin_re.MatchString(resp.URL())) {
 				logger.Info("stored browser cookies are expired, clearing cookies & resuming standard sign-in process")
 				cookieErr = fmt.Errorf("expired cookies")
@@ -306,8 +327,8 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 	oktaNextButtonSelectors := []string{"input[type=\"submit\"][value=\"Next\"]"}
 	oktaPasswordInputSelectors := []string{"input[type=\"password\"]"}
 	oktaVerifyButtonSelectors := []string{"input[type=\"submit\"][value=\"Verify\"]"}
-	// okta_verify-totp for code
-	oktaMFASelectButtonSelectors := []string{"div[class=authenticator-button][data-se=\"okta_verify-push\""}
+	// okta_verify-totp for code - Not implemented
+	oktaMFASelectButtonSelectors := []string{"div[class=authenticator-button][data-se=\"okta_verify-push\"]"}
 
 	if cookieErr != nil { // if found cookies has errors loading
 		logger.Debugf("starting okta login page automation...")
@@ -331,7 +352,12 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 			logger.Debug("okta remember me checkbox selector not found!")
 		} else {
 			logger.Debugf("okta remember me checkbox selector '%s' found, attempting to check it...", *matchedRememberMeCheckboxSelectorStr)
-			err = rememberMeCheckboxSelector.SetChecked(true)
+			timeout := 1500.0
+			forceCheck := true
+			err = rememberMeCheckboxSelector.Check(playwright.LocatorCheckOptions{
+				Force:   &forceCheck,
+				Timeout: &timeout,
+			})
 			if err != nil {
 				logger.Debugf("error checking the okta remember me checkbox: %v", err)
 			}
