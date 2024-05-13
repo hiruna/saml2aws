@@ -219,7 +219,7 @@ func findPlaywrightCookiesInCredentialStore(loginDetails *creds.LoginDetails) ([
 		return nil, fmt.Errorf("no playwright cookies found in keychain for '%s'", loginDetails.URL)
 	} else {
 		if playwrightCookies == "expiredCookies" {
-			return nil, fmt.Errorf("playwright cookies found in keychain for '%s' are expired")
+			return nil, fmt.Errorf("playwright cookies found in keychain for '%s' are expired", loginDetails.URL)
 		} else {
 			err = json.Unmarshal([]byte(playwrightCookies), &foundCookies)
 			if err != nil {
@@ -281,6 +281,14 @@ func addPlaywrightCookiesToPage(page playwright.Page, cookies []playwright.Optio
 }
 
 var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDetails, client *Client) (string, error) {
+	// https://docs.aws.amazon.com/general/latest/gr/signin-service.html
+	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Ningxia.html
+	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Beijing.html
+	signin_re, err := signinRegex()
+	if err != nil {
+		return "", err
+	}
+
 	logger.WithField("URL", loginDetails.URL).Info("opening browser")
 
 	// check for existing cookies in keychain
@@ -290,47 +298,49 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 		cookieErr = addPlaywrightCookiesToPage(page, foundCookies)
 	}
 
+	pageIsAwsSamlPage := false
+
 	if _, err := page.Goto(loginDetails.URL); err != nil {
 		return "", err
 	}
 
-	pageIsAwsSamlPage := false
+	var req playwright.Request
+
 	if cookieErr == nil { // if found cookies were successfully loaded
+		timeoutMillis := 10000.0
 		// check if the url navigation ends up in aws saml page
-		signin_re, err := signinRegex()
-		if err == nil {
-			logger.Info("checking if stored browser cookies are valid...")
-			timeoutMillis := 5000.0
-			resp, _ := page.ExpectRequest(signin_re, nil, playwright.PageExpectRequestOptions{Timeout: &timeoutMillis})
-			if resp == nil || (resp != nil && !signin_re.MatchString(resp.URL())) {
-				logger.Info("stored browser cookies are expired, clearing cookies & resuming standard sign-in process")
-				cookieErr = fmt.Errorf("expired cookies")
-				err = page.Context().ClearCookies()
-				if err != nil {
-					logger.Debugf("error clearing active browser cookies: %v", err)
-				}
-				err = setPlaywrightCookiesAsExpiredInCredentialStore(loginDetails)
-				if err != nil {
-					logger.Debugf("setPlaywrightCookiesAsExpiredInCredentialStore error: %v", err)
-				}
-				if _, err := page.Goto(loginDetails.URL); err != nil {
-					return "", err
-				}
-			} else {
-				pageIsAwsSamlPage = true
+		req, err = page.ExpectRequest(signin_re, func() error {
+			_, err = page.Reload()
+			return err
+		}, playwright.PageExpectRequestOptions{Timeout: &timeoutMillis})
+		if err != nil {
+			logger.Info("stored browser cookies are expired, clearing cookies & resuming standard sign-in process")
+			cookieErr = fmt.Errorf("expired cookies")
+			err = page.Context().ClearCookies()
+			if err != nil {
+				logger.Debugf("error clearing active browser cookies: %v", err)
 			}
+			err = setPlaywrightCookiesAsExpiredInCredentialStore(loginDetails)
+			if err != nil {
+				logger.Debugf("setPlaywrightCookiesAsExpiredInCredentialStore error: %v", err)
+			}
+			if _, err := page.Goto(loginDetails.URL); err != nil {
+				return "", err
+			}
+		} else if req != nil && !signin_re.MatchString(req.URL()) {
+			pageIsAwsSamlPage = true
 		}
 	}
 
-	oktaUsernameInputSelectors := []string{"input[name=\"identifier\"]", "input[autocomplete=\"username\"]"}
-	oktaRememberMeCheckboxSelectors := []string{"input[type=\"checkbox\"][name=\"rememberMe\"]"}
-	oktaNextButtonSelectors := []string{"input[type=\"submit\"][value=\"Next\"]"}
-	oktaPasswordInputSelectors := []string{"input[type=\"password\"]"}
-	oktaVerifyButtonSelectors := []string{"input[type=\"submit\"][value=\"Verify\"]"}
-	// okta_verify-totp for code - Not implemented
-	oktaMFASelectButtonSelectors := []string{"div[class=authenticator-button][data-se=\"okta_verify-push\"]"}
+	if !pageIsAwsSamlPage && cookieErr != nil { // if found cookies has errors loading
+		oktaUsernameInputSelectors := []string{"input[name=\"identifier\"]", "input[autocomplete=\"username\"]"}
+		oktaRememberMeCheckboxSelectors := []string{"input[type=\"checkbox\"][name=\"rememberMe\"]"}
+		oktaNextButtonSelectors := []string{"input[type=\"submit\"][value=\"Next\"]"}
+		oktaPasswordInputSelectors := []string{"input[type=\"password\"]"}
+		oktaVerifyButtonSelectors := []string{"input[type=\"submit\"][value=\"Verify\"]"}
+		// okta_verify-totp for code - Not implemented
+		oktaMFASelectButtonSelectors := []string{"div[class=authenticator-button][data-se=\"okta_verify-push\"]"}
 
-	if cookieErr != nil { // if found cookies has errors loading
 		logger.Debugf("starting okta login page automation...")
 		usernameInputLocator, matchedUsernameInputSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaUsernameInputSelectors)
 		if err != nil {
@@ -412,25 +422,10 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 		}
 
 		logger.Debugf("ui element query automation complete")
+		req, _ = page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
 	}
 
-	// https://docs.aws.amazon.com/general/latest/gr/signin-service.html
-	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Ningxia.html
-	// https://docs.amazonaws.cn/en_us/aws/latest/userguide/endpoints-Beijing.html
-	signin_re, err := signinRegex()
-	if err != nil {
-		return "", err
-	}
-
-	fmt.Println("waiting ...")
-	if pageIsAwsSamlPage {
-		go func() {
-			time.Sleep(5 * time.Second)
-			page.Reload()
-		}()
-	}
-	r, _ := page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
-	data, err := r.PostData()
+	data, err := req.PostData()
 	if err != nil {
 		return "", err
 	}
