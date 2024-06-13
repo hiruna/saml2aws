@@ -409,17 +409,20 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 			return "", fmt.Errorf("error clicking okta Verify button: %v", err)
 		}
 
-		mfaSelectButtonSelector, matchedMFASelectButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaMFASelectButtonSelectors)
-		if err != nil {
-			return "", fmt.Errorf("okta MFA Select button not found: %v", err)
-		} else {
-			logger.Debugf("okta MFA Select button selector '%s' selector is visible...", *matchedMFASelectButtonSelectorStr)
+		pushNotificationSentLocation := page.GetByText("Push notification sent")
+		if pushNotificationSentLocation == nil {
+			mfaSelectButtonSelector, matchedMFASelectButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaMFASelectButtonSelectors)
+			if err != nil {
+				logger.Debugf("okta MFA Select button not found: %v", err)
+			} else {
+				logger.Debugf("okta MFA Select button selector '%s' selector is visible...", *matchedMFASelectButtonSelectorStr)
+			}
+			err = mfaSelectButtonSelector.Click()
+			if err != nil {
+				return "", fmt.Errorf("error clicking okta MFA Select button: %v", err)
+			}
 		}
-
-		err = mfaSelectButtonSelector.Click()
-		if err != nil {
-			return "", fmt.Errorf("error clicking okta MFA Select button: %v", err)
-		}
+		logger.Info("Okta MFA Push notification sent...")
 
 		logger.Debugf("ui element query automation complete")
 		req, _ = page.ExpectRequest(signin_re, nil, client.expectRequestTimeout())
