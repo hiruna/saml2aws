@@ -409,8 +409,9 @@ var getOktaSAMLResponse = func(page playwright.Page, loginDetails *creds.LoginDe
 			return "", fmt.Errorf("error clicking okta Verify button: %v", err)
 		}
 
-		pushNotificationSentLocation := page.GetByText("Push notification sent")
-		if pushNotificationSentLocation == nil {
+		pushNotificationSentLocator := page.GetByText("Push notification sent")
+		pushNotificationSentLocatorCount, _ := pushNotificationSentLocator.Count()
+		if pushNotificationSentLocatorCount == 0 {
 			mfaSelectButtonSelector, matchedMFASelectButtonSelectorStr, err := pageWaitForOneOfLocatorVisible(page, oktaMFASelectButtonSelectors)
 			if err != nil {
 				logger.Debugf("okta MFA Select button not found: %v", err)
